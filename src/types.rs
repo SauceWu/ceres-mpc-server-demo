@@ -21,6 +21,8 @@ pub struct WireEnvelope {
     pub step: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub payloads: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub curve: Option<String>,
 }
 
 impl WireEnvelope {
@@ -42,6 +44,7 @@ impl WireEnvelope {
             payload,
             step: None,
             payloads: None,
+            curve: None,
         }
     }
 
@@ -63,6 +66,7 @@ impl WireEnvelope {
             payload: String::new(),
             step: None,
             payloads: Some(payloads),
+            curve: None,
         }
     }
 
@@ -90,6 +94,8 @@ pub struct KeygenParams {
     pub session_id: Option<String>,
     #[serde(default)]
     pub client_payload: Option<String>,
+    #[serde(default)]
+    pub curve: Option<String>,
 }
 
 /// Unified sign params
@@ -105,6 +111,8 @@ pub struct SignParams {
     pub session_id: Option<String>,
     #[serde(default)]
     pub client_payload: Option<String>,
+    #[serde(default)]
+    pub curve: Option<String>,
 }
 
 /// Unified recovery params
@@ -118,6 +126,8 @@ pub struct RecoveryParams {
     pub session_id: Option<String>,
     #[serde(default)]
     pub client_payload: Option<String>,
+    #[serde(default)]
+    pub curve: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
