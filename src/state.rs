@@ -89,6 +89,43 @@ pub struct AppState {
     pub sign_sessions: Arc<DashMap<String, Arc<SignSession>>>,
     pub recovery_sessions: Arc<DashMap<String, Arc<RecoverySession>>>,
     pub keystore: Arc<DashMap<String, KeyRecord>>,
+    pub frost_keygen_sessions: Arc<DashMap<String, Arc<FrostKeygenSession>>>,
+    pub frost_sign_sessions: Arc<DashMap<String, Arc<FrostSignSession>>>,
+    pub frost_recovery_sessions: Arc<DashMap<String, Arc<FrostRecoverySession>>>,
+    pub frost_keystore: Arc<DashMap<String, FrostKeyRecord>>,
+}
+
+// ── FROST-Ed25519 session types ──────────────────────────────────
+
+use frost_ed25519::keys::dkg::{round1 as frost_r1, round2 as frost_r2};
+
+pub struct FrostKeygenSession {
+    pub round1_secret: tokio::sync::Mutex<Option<frost_r1::SecretPackage>>,
+    pub round2_secret: tokio::sync::Mutex<Option<frost_r2::SecretPackage>>,
+    pub created_at: Instant,
+}
+
+pub struct FrostSignSession {
+    pub nonces: tokio::sync::Mutex<Option<frost_ed25519::round1::SigningNonces>>,
+    pub message_hash: [u8; 32],
+    pub mpc_key_id: String,
+    pub created_at: Instant,
+}
+
+pub struct FrostRecoverySession {
+    pub round1_secret: tokio::sync::Mutex<Option<frost_r1::SecretPackage>>,
+    pub round2_secret: tokio::sync::Mutex<Option<frost_r2::SecretPackage>>,
+    pub mpc_key_id: String,
+    pub created_at: Instant,
+}
+
+pub struct FrostKeyRecord {
+    pub mpc_key_id: String,
+    pub key_package: frost_ed25519::keys::KeyPackage,
+    pub public_key_package: frost_ed25519::keys::PublicKeyPackage,
+    pub address: String,
+    pub rotation_version: i32,
+    pub exported: bool,
 }
 
 impl AppState {
@@ -98,6 +135,10 @@ impl AppState {
             sign_sessions: Arc::new(DashMap::new()),
             recovery_sessions: Arc::new(DashMap::new()),
             keystore: Arc::new(DashMap::new()),
+            frost_keygen_sessions: Arc::new(DashMap::new()),
+            frost_sign_sessions: Arc::new(DashMap::new()),
+            frost_recovery_sessions: Arc::new(DashMap::new()),
+            frost_keystore: Arc::new(DashMap::new()),
         }
     }
 
@@ -105,6 +146,9 @@ impl AppState {
         let keygen_sessions = Arc::clone(&self.keygen_sessions);
         let sign_sessions = Arc::clone(&self.sign_sessions);
         let recovery_sessions = Arc::clone(&self.recovery_sessions);
+        let frost_keygen_sessions = Arc::clone(&self.frost_keygen_sessions);
+        let frost_sign_sessions = Arc::clone(&self.frost_sign_sessions);
+        let frost_recovery_sessions = Arc::clone(&self.frost_recovery_sessions);
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(30));
@@ -116,6 +160,12 @@ impl AppState {
                 sign_sessions
                     .retain(|_, session| now.duration_since(session.created_at) <= SESSION_TTL);
                 recovery_sessions
+                    .retain(|_, session| now.duration_since(session.created_at) <= SESSION_TTL);
+                frost_keygen_sessions
+                    .retain(|_, session| now.duration_since(session.created_at) <= SESSION_TTL);
+                frost_sign_sessions
+                    .retain(|_, session| now.duration_since(session.created_at) <= SESSION_TTL);
+                frost_recovery_sessions
                     .retain(|_, session| now.duration_since(session.created_at) <= SESSION_TTL);
             }
         });
