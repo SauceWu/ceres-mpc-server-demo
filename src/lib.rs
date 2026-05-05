@@ -1,4 +1,5 @@
 pub mod address;
+pub mod frost;
 pub mod relay;
 pub mod rpc;
 pub mod state;
@@ -143,6 +144,11 @@ async fn ws_connection(state: AppState, socket: WebSocket) {
 async fn handle_keygen(state: AppState, params: Value) -> Result<Value, RpcProblem> {
     let params: KeygenParams = parse_params(params)?;
 
+    // FROST-Ed25519 分发：curve == "ed25519" 时进入 FROST 路径（Phase 7 实现）
+    if params.curve.as_deref() == Some("ed25519") {
+        return Err(RpcProblem::new(-32603, "FROST keygen not implemented yet (Phase 7)"));
+    }
+
     if params.round == 1 {
         keygen_start(state).await
     } else {
@@ -162,6 +168,18 @@ async fn handle_keygen(state: AppState, params: Value) -> Result<Value, RpcProbl
 
 async fn handle_sign(state: AppState, params: Value) -> Result<Value, RpcProblem> {
     let params: SignParams = parse_params(params)?;
+
+    // FROST-Ed25519 分发：round 1 时从 curve 字段判断；round > 1 时从 frost_sign_sessions 存在性判断（Phase 7）
+    if params.curve.as_deref() == Some("ed25519") {
+        return Err(RpcProblem::new(-32603, "FROST sign not implemented yet (Phase 7)"));
+    }
+    if params.round > 1 {
+        if let Some(session_id) = &params.session_id {
+            if state.frost_sign_sessions.contains_key(session_id.as_str()) {
+                return Err(RpcProblem::new(-32603, "FROST sign not implemented yet (Phase 7)"));
+            }
+        }
+    }
 
     if params.round == 1 {
         let mpc_key_id = params
@@ -188,6 +206,18 @@ async fn handle_sign(state: AppState, params: Value) -> Result<Value, RpcProblem
 
 async fn handle_recovery(state: AppState, params: Value) -> Result<Value, RpcProblem> {
     let params: RecoveryParams = parse_params(params)?;
+
+    // FROST-Ed25519 分发：round 1 时从 curve 字段判断；round > 1 时从 frost_recovery_sessions 存在性判断（Phase 8）
+    if params.curve.as_deref() == Some("ed25519") {
+        return Err(RpcProblem::new(-32603, "FROST recovery not implemented yet (Phase 8)"));
+    }
+    if params.round > 1 {
+        if let Some(session_id) = &params.session_id {
+            if state.frost_recovery_sessions.contains_key(session_id.as_str()) {
+                return Err(RpcProblem::new(-32603, "FROST recovery not implemented yet (Phase 8)"));
+            }
+        }
+    }
 
     if params.round == 1 {
         let mpc_key_id = params
@@ -933,6 +963,12 @@ async fn recovery_continue(state: AppState, params: Value) -> Result<Value, RpcP
 
 async fn export_key(state: AppState, params: Value) -> Result<Value, RpcProblem> {
     let params: ExportKeyParams = parse_params(params)?;
+
+    // FROST-Ed25519 分发：先查 frost_keystore，若命中则走 FROST export 路径（Phase 8）
+    if state.frost_keystore.contains_key(&params.mpc_key_id) {
+        return Err(RpcProblem::new(-32603, "FROST export not implemented yet (Phase 8)"));
+    }
+
     let mut key_record = state
         .keystore
         .get_mut(&params.mpc_key_id)
