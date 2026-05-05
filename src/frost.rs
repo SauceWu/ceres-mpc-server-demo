@@ -398,6 +398,266 @@ pub async fn frost_sign_round2(
     Ok(env)
 }
 
+// ── FROST recovery 3-round key refresh ──────────────────────────
+
+/// Recovery round 1: 读取旧 FrostKeyRecord，调用 refresh_dkg_part1，创建 FrostRecoverySession。
+pub async fn frost_recovery_round1(
+    mpc_key_id: &str,
+    client_r1_pkg_b64: &str,
+    state: &AppState,
+) -> Result<(String, WireEnvelope), RpcProblem> {
+    // Clone old key packages from keystore (DashMap ref dropped before any await)
+    let (old_key_pkg, old_pub_key_pkg) = {
+        let record = state
+            .frost_keystore
+            .get(mpc_key_id)
+            .ok_or_else(|| RpcProblem::new(-32003, format!("FROST key not found: {mpc_key_id}")))?;
+        (record.key_package.clone(), record.public_key_package.clone())
+    };
+
+    let client_r1_json = BASE64_STANDARD
+        .decode(client_r1_pkg_b64)
+        .map_err(|e| RpcProblem::new(-32600, format!("base64 decode client r1 pkg: {e}")))?;
+    let client_r1_pkg: dkg_r1::Package = serde_json::from_slice(&client_r1_json)
+        .map_err(|e| RpcProblem::new(-32600, format!("deserialize client r1 pkg: {e}")))?;
+
+    let mut rng = rand::thread_rng();
+    let server_id = Identifier::try_from(2u16)
+        .map_err(|e| RpcProblem::new(-32603, format!("Identifier(2) failed: {e}")))?;
+    let (r1_secret, r1_pkg) =
+        frost_ed25519::keys::refresh::refresh_dkg_part1(server_id, 2, 2, &mut rng)
+            .map_err(|e| RpcProblem::new(-32603, format!("refresh_dkg_part1 failed: {e}")))?;
+
+    let mut session_bytes = [0u8; 32];
+    rng.fill_bytes(&mut session_bytes);
+    let session_id = hex::encode(session_bytes);
+
+    let session = crate::state::FrostRecoverySession {
+        round1_secret: Mutex::new(Some(r1_secret)),
+        round2_secret: Mutex::new(None),
+        old_key_package: Mutex::new(Some(old_key_pkg)),
+        old_pub_key_package: Mutex::new(Some(old_pub_key_pkg)),
+        client_r1_package: Mutex::new(Some(client_r1_pkg)),
+        client_r2_package: Mutex::new(None),
+        mpc_key_id: mpc_key_id.to_string(),
+        created_at: Instant::now(),
+    };
+    state
+        .frost_recovery_sessions
+        .insert(session_id.clone(), Arc::new(session));
+
+    let r1_json = serde_json::to_string(&r1_pkg)
+        .map_err(|e| RpcProblem::new(-32603, format!("serialize server r1 pkg: {e}")))?;
+    let r1_b64 = BASE64_STANDARD.encode(r1_json.as_bytes());
+
+    let mut env = WireEnvelope::new(
+        session_id.clone(),
+        ProtocolType::Rotation,
+        1,
+        1,
+        Some(0),
+        r1_b64,
+    );
+    env.curve = Some("ed25519".to_string());
+
+    Ok((session_id, env))
+}
+
+/// Recovery round 2: 推进 refresh_dkg_part2，返回 server r2 package。
+pub async fn frost_recovery_round2(
+    session_id: &str,
+    client_r2_pkg_b64: &str,
+    state: &AppState,
+) -> Result<WireEnvelope, RpcProblem> {
+    let session = state
+        .frost_recovery_sessions
+        .get(session_id)
+        .map(|e| Arc::clone(e.value()))
+        .ok_or_else(|| {
+            RpcProblem::new(-32001, format!("FROST recovery session not found: {session_id}"))
+        })?;
+
+    if session.created_at.elapsed() > SESSION_TTL {
+        state.frost_recovery_sessions.remove(session_id);
+        return Err(RpcProblem::new(
+            -32001,
+            format!("FROST recovery session expired: {session_id}"),
+        ));
+    }
+
+    let client_r2_json = BASE64_STANDARD
+        .decode(client_r2_pkg_b64)
+        .map_err(|e| RpcProblem::new(-32600, format!("base64 decode client r2 pkg: {e}")))?;
+    let client_r2_pkg: dkg_r2::Package = serde_json::from_slice(&client_r2_json)
+        .map_err(|e| RpcProblem::new(-32600, format!("deserialize client r2 pkg: {e}")))?;
+
+    let r1_secret = session
+        .round1_secret
+        .lock()
+        .await
+        .take()
+        .ok_or_else(|| RpcProblem::new(-32603, "round1_secret missing"))?;
+
+    let client_r1_pkg = session
+        .client_r1_package
+        .lock()
+        .await
+        .clone()
+        .ok_or_else(|| RpcProblem::new(-32603, "client_r1_package missing"))?;
+
+    let client_id = Identifier::try_from(1u16)
+        .map_err(|e| RpcProblem::new(-32603, format!("Identifier(1) failed: {e}")))?;
+
+    let mut round1_packages = BTreeMap::new();
+    round1_packages.insert(client_id, client_r1_pkg);
+
+    let (r2_secret, r2_pkgs_map) =
+        frost_ed25519::keys::refresh::refresh_dkg_part2(r1_secret, &round1_packages)
+            .map_err(|e| RpcProblem::new(-32603, format!("refresh_dkg_part2 failed: {e}")))?;
+
+    let r2_pkg_for_client = r2_pkgs_map
+        .get(&client_id)
+        .ok_or_else(|| RpcProblem::new(-32603, "no r2 package for client in part2 output"))?
+        .clone();
+
+    *session.round2_secret.lock().await = Some(r2_secret);
+    *session.client_r2_package.lock().await = Some(client_r2_pkg);
+
+    let r2_json = serde_json::to_string(&r2_pkg_for_client)
+        .map_err(|e| RpcProblem::new(-32603, format!("serialize server r2 pkg: {e}")))?;
+    let r2_b64 = BASE64_STANDARD.encode(r2_json.as_bytes());
+
+    let mut env = WireEnvelope::new(
+        session_id.to_string(),
+        ProtocolType::Rotation,
+        2,
+        1,
+        Some(0),
+        r2_b64,
+    );
+    env.curve = Some("ed25519".to_string());
+
+    Ok(env)
+}
+
+/// Recovery round 3 (finalize): 调用 refresh_dkg_shares，原子替换 frost_keystore，
+/// 返回 (mpc_key_id, address, new_rotation_version)。
+pub async fn frost_recovery_round3(
+    session_id: &str,
+    state: &AppState,
+) -> Result<(String, String, i32), RpcProblem> {
+    let session = state
+        .frost_recovery_sessions
+        .get(session_id)
+        .map(|e| Arc::clone(e.value()))
+        .ok_or_else(|| {
+            RpcProblem::new(-32001, format!("FROST recovery session not found: {session_id}"))
+        })?;
+
+    let r2_secret = session
+        .round2_secret
+        .lock()
+        .await
+        .take()
+        .ok_or_else(|| RpcProblem::new(-32603, "round2_secret missing"))?;
+
+    let old_key_pkg = session
+        .old_key_package
+        .lock()
+        .await
+        .take()
+        .ok_or_else(|| RpcProblem::new(-32603, "old_key_package missing"))?;
+
+    let old_pub_key_pkg = session
+        .old_pub_key_package
+        .lock()
+        .await
+        .take()
+        .ok_or_else(|| RpcProblem::new(-32603, "old_pub_key_package missing"))?;
+
+    let client_r1_pkg = session
+        .client_r1_package
+        .lock()
+        .await
+        .clone()
+        .ok_or_else(|| RpcProblem::new(-32603, "client_r1_package missing"))?;
+
+    let client_r2_pkg = session
+        .client_r2_package
+        .lock()
+        .await
+        .clone()
+        .ok_or_else(|| RpcProblem::new(-32603, "client_r2_package missing"))?;
+
+    let client_id = Identifier::try_from(1u16)
+        .map_err(|e| RpcProblem::new(-32603, format!("Identifier(1) failed: {e}")))?;
+
+    let mut round1_packages = BTreeMap::new();
+    round1_packages.insert(client_id, client_r1_pkg);
+    let mut round2_packages = BTreeMap::new();
+    round2_packages.insert(client_id, client_r2_pkg);
+
+    let (new_key_pkg, new_pub_key_pkg) = frost_ed25519::keys::refresh::refresh_dkg_shares(
+        &r2_secret,
+        &round1_packages,
+        &round2_packages,
+        old_pub_key_pkg,
+        old_key_pkg,
+    )
+    .map_err(|e| RpcProblem::new(-32603, format!("refresh_dkg_shares failed: {e}")))?;
+
+    let vk_ser = new_pub_key_pkg
+        .verifying_key()
+        .serialize()
+        .map_err(|e| RpcProblem::new(-32603, format!("vk serialize failed: {e}")))?;
+    let vk_bytes: &[u8] = vk_ser.as_ref();
+    let address = derive_solana_address(vk_bytes);
+
+    let old_rotation = state
+        .frost_keystore
+        .get(&session.mpc_key_id)
+        .map(|r| r.rotation_version)
+        .unwrap_or(1);
+    let new_rotation = old_rotation + 1;
+
+    let new_record = FrostKeyRecord {
+        mpc_key_id: session.mpc_key_id.clone(),
+        key_package: new_key_pkg,
+        public_key_package: new_pub_key_pkg,
+        address: address.clone(),
+        rotation_version: new_rotation,
+        exported: false,
+    };
+
+    // Atomic replace
+    state
+        .frost_keystore
+        .insert(session.mpc_key_id.clone(), new_record);
+    state.frost_recovery_sessions.remove(session_id);
+
+    Ok((session.mpc_key_id.clone(), address, new_rotation))
+}
+
+// ── FROST export ─────────────────────────────────────────────────
+
+/// Export: 返回服务端 SigningShare bytes（hex），设置 exported = true。
+/// 同步函数——不需要 await。
+pub fn frost_export(mpc_key_id: &str, state: &AppState) -> Result<String, RpcProblem> {
+    let mut record = state
+        .frost_keystore
+        .get_mut(mpc_key_id)
+        .ok_or_else(|| RpcProblem::new(-32003, format!("FROST key not found: {mpc_key_id}")))?;
+    if record.exported {
+        return Err(RpcProblem::new(
+            -32004,
+            format!("Key already exported: {mpc_key_id}"),
+        ));
+    }
+    let share_bytes = record.key_package.signing_share().serialize();
+    record.exported = true;
+    Ok(hex::encode(&share_bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -589,5 +849,185 @@ mod tests {
 
         // Client can aggregate: (omit full aggregate in unit test, structure is verified)
         let _ = client_nonces; // was consumed by commit(); nonces are in server session
+    }
+
+    /// Helper: run full keygen and return (state, mpc_key_id, client_key_pkg).
+    async fn run_keygen() -> (
+        AppState,
+        String,
+        frost_ed25519::keys::KeyPackage,
+        frost_ed25519::keys::PublicKeyPackage,
+    ) {
+        let state = AppState::new();
+        let mut rng = rand::thread_rng();
+        let client_id = Identifier::try_from(1u16).unwrap();
+        let server_id = Identifier::try_from(2u16).unwrap();
+
+        let (client_r1_secret, client_r1_pkg) = dkg::part1(client_id, 2, 2, &mut rng).unwrap();
+        let client_r1_b64 =
+            BASE64_STANDARD.encode(serde_json::to_string(&client_r1_pkg).unwrap().as_bytes());
+
+        let (session_id, server_env_r1) =
+            frost_keygen_round1(&client_r1_b64, &state).await.unwrap();
+
+        let server_r1_json = BASE64_STANDARD.decode(&server_env_r1.payload).unwrap();
+        let server_r1_pkg: dkg::round1::Package =
+            serde_json::from_slice(&server_r1_json).unwrap();
+
+        let mut client_r1_pkgs = BTreeMap::new();
+        client_r1_pkgs.insert(server_id, server_r1_pkg);
+        let (client_r2_secret, client_r2_pkgs) =
+            dkg::part2(client_r1_secret, &client_r1_pkgs).unwrap();
+
+        let r2_for_server = client_r2_pkgs.get(&server_id).unwrap();
+        let r2_b64 =
+            BASE64_STANDARD.encode(serde_json::to_string(r2_for_server).unwrap().as_bytes());
+
+        let server_env_r2 = frost_keygen_round2(&session_id, &r2_b64, &state)
+            .await
+            .unwrap();
+
+        let server_r2_json = BASE64_STANDARD.decode(&server_env_r2.payload).unwrap();
+        let server_r2_pkg: dkg::round2::Package =
+            serde_json::from_slice(&server_r2_json).unwrap();
+
+        let mut client_r2_pkgs_for_part3 = BTreeMap::new();
+        client_r2_pkgs_for_part3.insert(server_id, server_r2_pkg);
+        let (client_key_pkg, client_pub_key_pkg) =
+            dkg::part3(&client_r2_secret, &client_r1_pkgs, &client_r2_pkgs_for_part3).unwrap();
+
+        let (mpc_key_id, _, _) = frost_keygen_round3(&session_id, &state).await.unwrap();
+
+        (state, mpc_key_id, client_key_pkg, client_pub_key_pkg)
+    }
+
+    #[tokio::test]
+    async fn test_frost_recovery_full_roundtrip() {
+        use frost_ed25519::keys::refresh;
+
+        let (state, mpc_key_id, client_key_pkg, client_pub_key_pkg) = run_keygen().await;
+        let original_rotation = state
+            .frost_keystore
+            .get(&mpc_key_id)
+            .unwrap()
+            .rotation_version;
+        assert_eq!(original_rotation, 1);
+
+        let mut rng = rand::thread_rng();
+        let client_id = Identifier::try_from(1u16).unwrap();
+        let server_id = Identifier::try_from(2u16).unwrap();
+
+        // Client: refresh round 1
+        let (client_r1_secret, client_r1_pkg) =
+            refresh::refresh_dkg_part1(client_id, 2, 2, &mut rng).unwrap();
+        let client_r1_b64 =
+            BASE64_STANDARD.encode(serde_json::to_string(&client_r1_pkg).unwrap().as_bytes());
+
+        // Server: recovery round 1
+        let (recovery_session_id, server_env_r1) =
+            frost_recovery_round1(&mpc_key_id, &client_r1_b64, &state)
+                .await
+                .unwrap();
+        assert_eq!(server_env_r1.round, 1);
+        assert_eq!(server_env_r1.curve, Some("ed25519".to_string()));
+
+        // Client: refresh round 2
+        let server_r1_json = BASE64_STANDARD.decode(&server_env_r1.payload).unwrap();
+        let server_r1_pkg: dkg::round1::Package =
+            serde_json::from_slice(&server_r1_json).unwrap();
+
+        let mut client_r1_pkgs = BTreeMap::new();
+        client_r1_pkgs.insert(server_id, server_r1_pkg);
+        let (client_r2_secret, client_r2_pkgs) =
+            refresh::refresh_dkg_part2(client_r1_secret, &client_r1_pkgs).unwrap();
+
+        let r2_for_server = client_r2_pkgs.get(&server_id).unwrap();
+        let r2_b64 =
+            BASE64_STANDARD.encode(serde_json::to_string(r2_for_server).unwrap().as_bytes());
+
+        // Server: recovery round 2
+        let server_env_r2 = frost_recovery_round2(&recovery_session_id, &r2_b64, &state)
+            .await
+            .unwrap();
+        assert_eq!(server_env_r2.round, 2);
+
+        // Client: finalize refresh
+        let server_r2_json = BASE64_STANDARD.decode(&server_env_r2.payload).unwrap();
+        let server_r2_pkg: dkg::round2::Package =
+            serde_json::from_slice(&server_r2_json).unwrap();
+
+        let mut client_r2_pkgs_for_finalize = BTreeMap::new();
+        client_r2_pkgs_for_finalize.insert(server_id, server_r2_pkg);
+        let (_new_client_key_pkg, _) = refresh::refresh_dkg_shares(
+            &client_r2_secret,
+            &client_r1_pkgs,
+            &client_r2_pkgs_for_finalize,
+            client_pub_key_pkg,
+            client_key_pkg,
+        )
+        .unwrap();
+
+        // Server: recovery round 3
+        let (returned_mpc_key_id, address, rotation_version) =
+            frost_recovery_round3(&recovery_session_id, &state)
+                .await
+                .unwrap();
+
+        assert_eq!(returned_mpc_key_id, mpc_key_id);
+        assert!(!address.is_empty());
+        assert_eq!(rotation_version, 2, "rotation_version should be incremented");
+        assert_eq!(
+            state
+                .frost_keystore
+                .get(&mpc_key_id)
+                .unwrap()
+                .rotation_version,
+            2
+        );
+        assert!(!state.frost_recovery_sessions.contains_key(&recovery_session_id));
+    }
+
+    #[tokio::test]
+    async fn test_frost_export_and_sign_guard() {
+        use frost_ed25519::round1 as sign_r1;
+
+        let (state, mpc_key_id, client_key_pkg, _) = run_keygen().await;
+
+        // Export should succeed
+        let share_hex = frost_export(&mpc_key_id, &state).unwrap();
+        assert!(!share_hex.is_empty(), "share hex must not be empty");
+        assert!(share_hex.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // Key should be marked exported
+        assert!(state.frost_keystore.get(&mpc_key_id).unwrap().exported);
+
+        // Double-export should fail
+        assert!(frost_export(&mpc_key_id, &state).is_err());
+
+        // frost_sign_round1 should reject exported key
+        let mut rng = rand::thread_rng();
+        let (_, client_commitments) =
+            sign_r1::commit(client_key_pkg.signing_share(), &mut rng);
+        let client_commitments_b64 = BASE64_STANDARD.encode(
+            serde_json::to_string(&client_commitments).unwrap().as_bytes(),
+        );
+        let mut fake_hash = [0u8; 32];
+        rng.fill_bytes(&mut fake_hash);
+        let message_hash_hex = hex::encode(fake_hash);
+
+        let result = frost_sign_round1(
+            &mpc_key_id,
+            &client_commitments_b64,
+            &message_hash_hex,
+            &state,
+        )
+        .await;
+        assert!(result.is_err(), "sign must be rejected after export");
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("exported"),
+            "error message should mention exported, got: {}",
+            err.message
+        );
     }
 }

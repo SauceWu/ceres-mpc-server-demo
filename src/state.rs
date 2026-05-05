@@ -119,6 +119,10 @@ pub struct FrostSignSession {
 pub struct FrostRecoverySession {
     pub round1_secret: tokio::sync::Mutex<Option<frost_r1::SecretPackage>>,
     pub round2_secret: tokio::sync::Mutex<Option<frost_r2::SecretPackage>>,
+    pub old_key_package: tokio::sync::Mutex<Option<frost_ed25519::keys::KeyPackage>>,
+    pub old_pub_key_package: tokio::sync::Mutex<Option<frost_ed25519::keys::PublicKeyPackage>>,
+    pub client_r1_package: tokio::sync::Mutex<Option<frost_r1::Package>>,
+    pub client_r2_package: tokio::sync::Mutex<Option<frost_r2::Package>>,
     pub mpc_key_id: String,
     pub created_at: Instant,
 }

@@ -267,14 +267,59 @@ async fn handle_sign(state: AppState, params: Value) -> Result<Value, RpcProblem
 async fn handle_recovery(state: AppState, params: Value) -> Result<Value, RpcProblem> {
     let params: RecoveryParams = parse_params(params)?;
 
-    // FROST-Ed25519 分发：round 1 时从 curve 字段判断；round > 1 时从 frost_recovery_sessions 存在性判断（Phase 8）
+    // FROST-Ed25519 分发：round 1 via curve；round > 1 via frost_recovery_sessions 存在性
     if params.curve.as_deref() == Some("ed25519") {
-        return Err(RpcProblem::new(-32603, "FROST recovery not implemented yet (Phase 8)"));
+        let mpc_key_id = params.mpc_key_id.ok_or_else(|| {
+            RpcProblem::new(-32600, "Missing mpcKeyId for FROST recovery round 1")
+        })?;
+        let client_payload = params.client_payload.ok_or_else(|| {
+            RpcProblem::new(-32600, "Missing clientPayload for FROST recovery round 1")
+        })?;
+        let (session_id, envelope) =
+            frost::frost_recovery_round1(&mpc_key_id, &client_payload, &state).await?;
+        return Ok(json!(StartResponse { session_id, server_payload: envelope }));
     }
     if params.round > 1 {
         if let Some(session_id) = &params.session_id {
             if state.frost_recovery_sessions.contains_key(session_id.as_str()) {
-                return Err(RpcProblem::new(-32603, "FROST recovery not implemented yet (Phase 8)"));
+                if params.round == 2 {
+                    let client_payload = params.client_payload.ok_or_else(|| {
+                        RpcProblem::new(-32600, "Missing clientPayload for FROST recovery round 2")
+                    })?;
+                    let envelope =
+                        frost::frost_recovery_round2(session_id, &client_payload, &state).await?;
+                    return Ok(json!(StartResponse {
+                        session_id: session_id.clone(),
+                        server_payload: envelope,
+                    }));
+                }
+                if params.round == 3 {
+                    let (mpc_key_id, address, rotation_version) =
+                        frost::frost_recovery_round3(session_id, &state).await?;
+                    let public_key = state
+                        .frost_keystore
+                        .get(&mpc_key_id)
+                        .and_then(|r| {
+                            r.public_key_package
+                                .verifying_key()
+                                .serialize()
+                                .map(|b| hex::encode(b.as_ref() as &[u8]))
+                                .ok()
+                        })
+                        .unwrap_or_default();
+                    return Ok(json!(RecoveryCompletedResponse {
+                        status: "completed",
+                        mpc_key_id,
+                        address,
+                        public_key,
+                        rotation_version,
+                        local_encrypted_share: String::new(),
+                    }));
+                }
+                return Err(RpcProblem::new(
+                    -32600,
+                    format!("Unsupported FROST recovery round: {}", params.round),
+                ));
             }
         }
     }
@@ -1024,9 +1069,12 @@ async fn recovery_continue(state: AppState, params: Value) -> Result<Value, RpcP
 async fn export_key(state: AppState, params: Value) -> Result<Value, RpcProblem> {
     let params: ExportKeyParams = parse_params(params)?;
 
-    // FROST-Ed25519 分发：先查 frost_keystore，若命中则走 FROST export 路径（Phase 8）
+    // FROST-Ed25519 分发：先查 frost_keystore，若命中则走 FROST export 路径
     if state.frost_keystore.contains_key(&params.mpc_key_id) {
-        return Err(RpcProblem::new(-32603, "FROST export not implemented yet (Phase 8)"));
+        let share_hex = frost::frost_export(&params.mpc_key_id, &state)?;
+        return Ok(json!(ExportKeyResponse {
+            server_share_private: share_hex,
+        }));
     }
 
     let mut key_record = state
