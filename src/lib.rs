@@ -144,9 +144,50 @@ async fn ws_connection(state: AppState, socket: WebSocket) {
 async fn handle_keygen(state: AppState, params: Value) -> Result<Value, RpcProblem> {
     let params: KeygenParams = parse_params(params)?;
 
-    // FROST-Ed25519 分发：curve == "ed25519" 时进入 FROST 路径（Phase 7 实现）
+    // FROST-Ed25519 分发：curve == "ed25519" 时进入 FROST 路径
     if params.curve.as_deref() == Some("ed25519") {
-        return Err(RpcProblem::new(-32603, "FROST keygen not implemented yet (Phase 7)"));
+        if params.round == 1 {
+            let client_payload = params.client_payload.ok_or_else(|| {
+                RpcProblem::new(-32600, "Missing clientPayload for FROST keygen round 1")
+            })?;
+            let (session_id, envelope) =
+                frost::frost_keygen_round1(&client_payload, &state).await?;
+            return Ok(json!(StartResponse { session_id, server_payload: envelope }));
+        }
+        if params.round == 2 {
+            let session_id = params.session_id.ok_or_else(|| {
+                RpcProblem::new(-32600, "Missing sessionId for FROST keygen round 2")
+            })?;
+            let client_payload = params.client_payload.ok_or_else(|| {
+                RpcProblem::new(-32600, "Missing clientPayload for FROST keygen round 2")
+            })?;
+            let envelope =
+                frost::frost_keygen_round2(&session_id, &client_payload, &state).await?;
+            return Ok(json!(StartResponse { session_id, server_payload: envelope }));
+        }
+        if params.round == 3 {
+            let session_id = params.session_id.ok_or_else(|| {
+                RpcProblem::new(-32600, "Missing sessionId for FROST keygen round 3")
+            })?;
+            let (mpc_key_id, address, public_key) =
+                frost::frost_keygen_round3(&session_id, &state).await?;
+            return Ok(json!(KeygenCompletedResponse {
+                status: "completed",
+                mpc_key_id: mpc_key_id.clone(),
+                address,
+                public_key,
+                curve: "ed25519",
+                threshold: 2,
+                key_ref: mpc_key_id,
+                backup_state: "none",
+                rotation_version: 1,
+                local_encrypted_share: String::new(),
+            }));
+        }
+        return Err(RpcProblem::new(
+            -32600,
+            format!("Unsupported FROST keygen round: {}", params.round),
+        ));
     }
 
     if params.round == 1 {
@@ -169,14 +210,33 @@ async fn handle_keygen(state: AppState, params: Value) -> Result<Value, RpcProbl
 async fn handle_sign(state: AppState, params: Value) -> Result<Value, RpcProblem> {
     let params: SignParams = parse_params(params)?;
 
-    // FROST-Ed25519 分发：round 1 时从 curve 字段判断；round > 1 时从 frost_sign_sessions 存在性判断（Phase 7）
+    // FROST-Ed25519 分发：round 1 via curve 字段；round > 1 via frost_sign_sessions 存在性
     if params.curve.as_deref() == Some("ed25519") {
-        return Err(RpcProblem::new(-32603, "FROST sign not implemented yet (Phase 7)"));
+        let mpc_key_id = params.mpc_key_id.ok_or_else(|| {
+            RpcProblem::new(-32600, "Missing mpcKeyId for FROST sign round 1")
+        })?;
+        let message_hash = params.message_hash.ok_or_else(|| {
+            RpcProblem::new(-32600, "Missing messageHash for FROST sign round 1")
+        })?;
+        let client_payload = params.client_payload.ok_or_else(|| {
+            RpcProblem::new(-32600, "Missing clientPayload for FROST sign round 1")
+        })?;
+        let (session_id, envelope) =
+            frost::frost_sign_round1(&mpc_key_id, &client_payload, &message_hash, &state).await?;
+        return Ok(json!(StartResponse { session_id, server_payload: envelope }));
     }
     if params.round > 1 {
         if let Some(session_id) = &params.session_id {
             if state.frost_sign_sessions.contains_key(session_id.as_str()) {
-                return Err(RpcProblem::new(-32603, "FROST sign not implemented yet (Phase 7)"));
+                let client_payload = params.client_payload.ok_or_else(|| {
+                    RpcProblem::new(-32600, "Missing clientPayload for FROST sign round 2")
+                })?;
+                let envelope =
+                    frost::frost_sign_round2(session_id, &client_payload, &state).await?;
+                return Ok(json!(StartResponse {
+                    session_id: session_id.clone(),
+                    server_payload: envelope,
+                }));
             }
         }
     }
@@ -1074,6 +1134,47 @@ mod tests {
         // Should have result with sessionId and serverPayload
         assert!(json["result"]["sessionId"].is_string());
         assert!(json["result"]["serverPayload"]["payload"].is_string());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn frost_keygen_round1_creates_frost_session() {
+        use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+        use base64::Engine as _;
+        use frost_ed25519::keys::dkg;
+        use frost_ed25519::Identifier;
+
+        let state = AppState::new();
+        let app = build_app(state);
+
+        let mut rng = rand::thread_rng();
+        let client_id = Identifier::try_from(1u16).unwrap();
+        let (_, client_r1_pkg) = dkg::part1(client_id, 2, 2, &mut rng).unwrap();
+        let client_r1_b64 =
+            BASE64_STANDARD.encode(serde_json::to_string(&client_r1_pkg).unwrap().as_bytes());
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/rpc")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "keygen",
+                    "params": {"round": 1, "curve": "ed25519", "clientPayload": client_r1_b64},
+                    "id": 1
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["result"]["sessionId"].is_string(), "expected sessionId");
+        assert_eq!(json["result"]["serverPayload"]["curve"], "ed25519");
+        assert_eq!(json["result"]["serverPayload"]["round"], 1);
     }
 
     #[tokio::test]
