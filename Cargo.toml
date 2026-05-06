@@ -36,3 +36,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dashmap = "5"
 frost-ed25519 = "3"
 bs58 = "0.5"
+ceres_wallet_frost_mpc = { git = "https://github.com/SauceWu/ceres_wallet_frost_mpc", branch = "master" }

@@ -97,32 +97,21 @@ pub struct AppState {
 
 // ── FROST-Ed25519 session types ──────────────────────────────────
 
-use frost_ed25519::keys::dkg::{round1 as frost_r1, round2 as frost_r2};
+use ceres_wallet_frost_mpc::{KeygenSessionState, RecoverySessionState, SignSessionState};
 
 pub struct FrostKeygenSession {
-    pub round1_secret: tokio::sync::Mutex<Option<frost_r1::SecretPackage>>,
-    pub round2_secret: tokio::sync::Mutex<Option<frost_r2::SecretPackage>>,
-    pub client_r1_package: tokio::sync::Mutex<Option<frost_r1::Package>>,
-    pub server_r1_package: tokio::sync::Mutex<Option<frost_r1::Package>>,
-    pub client_r2_package: tokio::sync::Mutex<Option<frost_r2::Package>>,
+    pub state: Mutex<Option<KeygenSessionState>>,
     pub created_at: Instant,
 }
 
 pub struct FrostSignSession {
-    pub nonces: tokio::sync::Mutex<Option<frost_ed25519::round1::SigningNonces>>,
-    pub client_commitments: tokio::sync::Mutex<Option<frost_ed25519::round1::SigningCommitments>>,
-    pub message_hash: [u8; 32],
+    pub state: Mutex<Option<SignSessionState>>,
     pub mpc_key_id: String,
     pub created_at: Instant,
 }
 
 pub struct FrostRecoverySession {
-    pub round1_secret: tokio::sync::Mutex<Option<frost_r1::SecretPackage>>,
-    pub round2_secret: tokio::sync::Mutex<Option<frost_r2::SecretPackage>>,
-    pub old_key_package: tokio::sync::Mutex<Option<frost_ed25519::keys::KeyPackage>>,
-    pub old_pub_key_package: tokio::sync::Mutex<Option<frost_ed25519::keys::PublicKeyPackage>>,
-    pub client_r1_package: tokio::sync::Mutex<Option<frost_r1::Package>>,
-    pub client_r2_package: tokio::sync::Mutex<Option<frost_r2::Package>>,
+    pub state: Mutex<Option<RecoverySessionState>>,
     pub mpc_key_id: String,
     pub created_at: Instant,
 }

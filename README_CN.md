@@ -46,7 +46,7 @@ POST /rpc  或  WS /ws
 |------|------|
 | `main.rs` | 入口，启动 Axum 服务器 |
 | `lib.rs` | JSON-RPC 路由、协议 handler、曲线分发 |
-| `frost.rs` | FROST-Ed25519 协议函数（keygen/sign/recovery/export）+ ShareEnvelope v2 编解码 |
+| `frost.rs` | FROST-Ed25519 会话编排 — 所有密码学委托给 `ceres_wallet_frost_mpc` |
 | `relay.rs` | `ChannelRelayConn` — 将 sl-dkls23 Relay trait 桥接到 mpsc channel，带 `Notify` 轮次完成信号 |
 | `types.rs` | `WireEnvelope`（含 `curve`、`payloads` 批量字段）、协议参数/响应类型 |
 | `state.rs` | `AppState`、DKLs23 会话结构体、FROST 会话结构体、密钥记录存储 |
@@ -63,7 +63,11 @@ POST /rpc  或  WS /ws
 ### 运行
 
 ```bash
+# 开发模式
 cargo run
+
+# 生产 / 性能优先（推荐 — 密码学运算快 20-50x）
+cargo run --release
 ```
 
 服务器启动在 `http://0.0.0.0:3000`：
@@ -107,7 +111,7 @@ cargo test
 
 **Recovery（3 轮）：** 结构同 keygen，使用 `keys::refresh` API。finalize 时原子替换服务端 `KeyPackage`，`rotation_version` 自增。
 
-**Export（单次调用）：** 返回 `signing_share().serialize()` 的 hex 字符串。标记密钥为已导出，后续签名请求将被拒绝。
+**Export（单次调用）：** 返回 `ShareEnvelope v2` — `base64(json({ v:2, curve:"ed25519", share: base64(json({kp, pkp})) }))`。标记密钥为已导出，后续签名请求将被拒绝。
 
 ### WireEnvelope 格式
 
@@ -149,6 +153,7 @@ DKLs23 响应使用 `payloads` 数组（批量）。FROST 响应使用单条 `pa
 | [sl-dkls23](https://crates.io/crates/sl-dkls23) 1.0.0-beta | DKLs23 协议（keygen、sign、key refresh） |
 | [sl-mpc-mate](https://crates.io/crates/sl-mpc-mate) 1.0.0-beta | MPC 协调（Relay trait） |
 | [frost-ed25519](https://crates.io/crates/frost-ed25519) 3 | FROST Schnorr（keygen、sign、key refresh） |
+| [ceres_wallet_frost_mpc](https://github.com/SauceWu/ceres_wallet_frost_mpc) | FROST-Ed25519 2-of-2 密码学库 — keygen/sign/recovery/export/backup |
 | [tokio](https://crates.io/crates/tokio) 1 | 异步运行时 |
 | [k256](https://crates.io/crates/k256) 0.13 | secp256k1 椭圆曲线 |
 | [dashmap](https://crates.io/crates/dashmap) 5 | 并发会话/密钥存储 |

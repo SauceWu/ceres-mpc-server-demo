@@ -128,6 +128,8 @@ pub struct RecoveryParams {
     pub client_payload: Option<String>,
     #[serde(default)]
     pub curve: Option<String>,
+    #[serde(default)]
+    pub current_rotation_version: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]

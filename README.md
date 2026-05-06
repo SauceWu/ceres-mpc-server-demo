@@ -46,7 +46,7 @@ POST /rpc  or  WS /ws
 |------|---------|
 | `main.rs` | Entry point, starts Axum server |
 | `lib.rs` | JSON-RPC dispatch, protocol handlers, curve routing |
-| `frost.rs` | FROST-Ed25519 protocol functions (keygen/sign/recovery/export) + ShareEnvelope v2 codec |
+| `frost.rs` | FROST-Ed25519 session orchestrator — delegates all crypto to `ceres_wallet_frost_mpc` |
 | `relay.rs` | `ChannelRelayConn` — bridges sl-dkls23 Relay trait to mpsc channels with `Notify` round-complete signal |
 | `types.rs` | `WireEnvelope` (with `curve`, `payloads` batch field), protocol params/responses |
 | `state.rs` | `AppState`, DKLs23 session structs, FROST session structs, key record storage |
@@ -63,7 +63,11 @@ POST /rpc  or  WS /ws
 ### Run
 
 ```bash
+# Development
 cargo run
+
+# Production / performance (recommended — 20-50x faster for crypto operations)
+cargo run --release
 ```
 
 Server starts on `http://0.0.0.0:3000` with:
@@ -107,7 +111,7 @@ Pass `curve: "ed25519"`. Server acts as `Identifier(2)`, client as `Identifier(1
 
 **Recovery (3 rounds):** Same structure as keygen using `keys::refresh` API. Atomically replaces server `KeyPackage` on finalize. `rotation_version` increments.
 
-**Export (1 call):** Returns `signing_share().serialize()` as hex. Marks key as exported; subsequent sign calls are rejected.
+**Export (1 call):** Returns `ShareEnvelope v2` — `base64(json({ v:2, curve:"ed25519", share: base64(json({kp, pkp})) }))`. Marks key as exported; subsequent sign calls are rejected.
 
 ### WireEnvelope Format
 
@@ -149,6 +153,7 @@ See the [ceres_mpc Server Integration Guide](https://github.com/SauceWu/ceres-mp
 | [sl-dkls23](https://crates.io/crates/sl-dkls23) 1.0.0-beta | DKLs23 protocol (keygen, sign, key refresh) |
 | [sl-mpc-mate](https://crates.io/crates/sl-mpc-mate) 1.0.0-beta | MPC coordination (Relay trait) |
 | [frost-ed25519](https://crates.io/crates/frost-ed25519) 3 | FROST Schnorr (keygen, sign, key refresh) |
+| [ceres_wallet_frost_mpc](https://github.com/SauceWu/ceres_wallet_frost_mpc) | FROST-Ed25519 2-of-2 crypto library — keygen/sign/recovery/export/backup |
 | [tokio](https://crates.io/crates/tokio) 1 | Async runtime |
 | [k256](https://crates.io/crates/k256) 0.13 | secp256k1 elliptic curve |
 | [dashmap](https://crates.io/crates/dashmap) 5 | Concurrent session/key storage |

@@ -144,14 +144,12 @@ async fn ws_connection(state: AppState, socket: WebSocket) {
 async fn handle_keygen(state: AppState, params: Value) -> Result<Value, RpcProblem> {
     let params: KeygenParams = parse_params(params)?;
 
-    // FROST-Ed25519 分发：curve == "ed25519" 时进入 FROST 路径
-    if params.curve.as_deref() == Some("ed25519") {
+    // FROST-Ed25519 分发：curve == "ed25519" 或 frost_keygen_sessions 存在性
+    if params.curve.as_deref() == Some("ed25519")
+        || params.session_id.as_ref().map_or(false, |sid| state.frost_keygen_sessions.contains_key(sid.as_str()))
+    {
         if params.round == 1 {
-            let client_payload = params.client_payload.ok_or_else(|| {
-                RpcProblem::new(-32600, "Missing clientPayload for FROST keygen round 1")
-            })?;
-            let (session_id, envelope) =
-                frost::frost_keygen_round1(&client_payload, &state).await?;
+            let (session_id, envelope) = frost::frost_keygen_round1(&state).await?;
             return Ok(json!(StartResponse { session_id, server_payload: envelope }));
         }
         if params.round == 2 {
@@ -169,8 +167,11 @@ async fn handle_keygen(state: AppState, params: Value) -> Result<Value, RpcProbl
             let session_id = params.session_id.ok_or_else(|| {
                 RpcProblem::new(-32600, "Missing sessionId for FROST keygen round 3")
             })?;
+            let client_payload = params.client_payload.ok_or_else(|| {
+                RpcProblem::new(-32600, "Missing clientPayload for FROST keygen round 3")
+            })?;
             let (mpc_key_id, address, public_key) =
-                frost::frost_keygen_round3(&session_id, &state).await?;
+                frost::frost_keygen_round3(&session_id, &client_payload, &state).await?;
             return Ok(json!(KeygenCompletedResponse {
                 status: "completed",
                 mpc_key_id: mpc_key_id.clone(),
@@ -210,35 +211,43 @@ async fn handle_keygen(state: AppState, params: Value) -> Result<Value, RpcProbl
 async fn handle_sign(state: AppState, params: Value) -> Result<Value, RpcProblem> {
     let params: SignParams = parse_params(params)?;
 
-    // FROST-Ed25519 分发：round 1 via curve 字段；round > 1 via frost_sign_sessions 存在性
-    if params.curve.as_deref() == Some("ed25519") {
-        let mpc_key_id = params.mpc_key_id.ok_or_else(|| {
-            RpcProblem::new(-32600, "Missing mpcKeyId for FROST sign round 1")
-        })?;
+    // FROST-Ed25519 分发：round 1 via frost_keystore；round > 1 via frost_sign_sessions 存在性
+    let is_frost_sign_r1 = params.round == 1
+        && params.mpc_key_id.as_ref().map_or(false, |id| state.frost_keystore.contains_key(id.as_str()));
+    let is_frost_sign_r2 = params.round > 1
+        && params.session_id.as_ref().map_or(false, |sid| state.frost_sign_sessions.contains_key(sid.as_str()));
+
+    info!(
+        method = "sign",
+        round = params.round,
+        mpc_key_id = ?params.mpc_key_id,
+        session_id = ?params.session_id,
+        is_frost_r1 = is_frost_sign_r1,
+        is_frost_r2 = is_frost_sign_r2,
+        frost_sign_sessions = state.frost_sign_sessions.len(),
+        frost_keystore_len = state.frost_keystore.len(),
+        "sign routing"
+    );
+
+    if is_frost_sign_r1 {
+        let mpc_key_id = params.mpc_key_id.unwrap();
         let message_hash = params.message_hash.ok_or_else(|| {
             RpcProblem::new(-32600, "Missing messageHash for FROST sign round 1")
         })?;
-        let client_payload = params.client_payload.ok_or_else(|| {
-            RpcProblem::new(-32600, "Missing clientPayload for FROST sign round 1")
-        })?;
         let (session_id, envelope) =
-            frost::frost_sign_round1(&mpc_key_id, &client_payload, &message_hash, &state).await?;
+            frost::frost_sign_round1(&mpc_key_id, &message_hash, &state).await?;
         return Ok(json!(StartResponse { session_id, server_payload: envelope }));
     }
-    if params.round > 1 {
-        if let Some(session_id) = &params.session_id {
-            if state.frost_sign_sessions.contains_key(session_id.as_str()) {
-                let client_payload = params.client_payload.ok_or_else(|| {
-                    RpcProblem::new(-32600, "Missing clientPayload for FROST sign round 2")
-                })?;
-                let envelope =
-                    frost::frost_sign_round2(session_id, &client_payload, &state).await?;
-                return Ok(json!(StartResponse {
-                    session_id: session_id.clone(),
-                    server_payload: envelope,
-                }));
-            }
-        }
+    if is_frost_sign_r2 {
+        let session_id = params.session_id.as_ref().unwrap();
+        let client_payload = params.client_payload.ok_or_else(|| {
+            RpcProblem::new(-32600, "Missing clientPayload for FROST sign round 2")
+        })?;
+        let envelope = frost::frost_sign_round2(session_id, &client_payload, &state).await?;
+        return Ok(json!(StartResponse {
+            session_id: session_id.clone(),
+            server_payload: envelope,
+        }));
     }
 
     if params.round == 1 {
@@ -267,61 +276,82 @@ async fn handle_sign(state: AppState, params: Value) -> Result<Value, RpcProblem
 async fn handle_recovery(state: AppState, params: Value) -> Result<Value, RpcProblem> {
     let params: RecoveryParams = parse_params(params)?;
 
-    // FROST-Ed25519 分发：round 1 via curve；round > 1 via frost_recovery_sessions 存在性
-    if params.curve.as_deref() == Some("ed25519") {
-        let mpc_key_id = params.mpc_key_id.ok_or_else(|| {
-            RpcProblem::new(-32600, "Missing mpcKeyId for FROST recovery round 1")
-        })?;
-        let client_payload = params.client_payload.ok_or_else(|| {
-            RpcProblem::new(-32600, "Missing clientPayload for FROST recovery round 1")
-        })?;
-        let (session_id, envelope) =
-            frost::frost_recovery_round1(&mpc_key_id, &client_payload, &state).await?;
-        return Ok(json!(StartResponse { session_id, server_payload: envelope }));
-    }
-    if params.round > 1 {
-        if let Some(session_id) = &params.session_id {
-            if state.frost_recovery_sessions.contains_key(session_id.as_str()) {
-                if params.round == 2 {
-                    let client_payload = params.client_payload.ok_or_else(|| {
-                        RpcProblem::new(-32600, "Missing clientPayload for FROST recovery round 2")
-                    })?;
-                    let envelope =
-                        frost::frost_recovery_round2(session_id, &client_payload, &state).await?;
-                    return Ok(json!(StartResponse {
-                        session_id: session_id.clone(),
-                        server_payload: envelope,
-                    }));
-                }
-                if params.round == 3 {
-                    let (mpc_key_id, address, rotation_version) =
-                        frost::frost_recovery_round3(session_id, &state).await?;
-                    let public_key = state
-                        .frost_keystore
-                        .get(&mpc_key_id)
-                        .and_then(|r| {
-                            r.public_key_package
-                                .verifying_key()
-                                .serialize()
-                                .map(|b| hex::encode(b.as_ref() as &[u8]))
-                                .ok()
-                        })
-                        .unwrap_or_default();
-                    return Ok(json!(RecoveryCompletedResponse {
-                        status: "completed",
-                        mpc_key_id,
-                        address,
-                        public_key,
-                        rotation_version,
-                        local_encrypted_share: String::new(),
-                    }));
-                }
+    // FROST-Ed25519 分发：round 1 via frost_keystore；round > 1 via frost_recovery_sessions 存在性
+    let is_frost_recovery_r1 = params.round == 1
+        && params.mpc_key_id.as_ref().map_or(false, |id| state.frost_keystore.contains_key(id.as_str()));
+    let is_frost_recovery_rn = params.round > 1
+        && params.session_id.as_ref().map_or(false, |sid| state.frost_recovery_sessions.contains_key(sid.as_str()));
+
+    if is_frost_recovery_r1 {
+        let mpc_key_id = params.mpc_key_id.unwrap();
+        // 防止旧 share 攻击：客户端必须声明当前版本，且必须与服务端一致
+        if let Some(client_ver) = params.current_rotation_version {
+            let server_ver = state
+                .frost_keystore
+                .get(&mpc_key_id)
+                .map(|r| r.rotation_version)
+                .unwrap_or(0);
+            if client_ver != server_ver {
                 return Err(RpcProblem::new(
                     -32600,
-                    format!("Unsupported FROST recovery round: {}", params.round),
+                    format!(
+                        "rotation_version mismatch: expected {server_ver}, got {client_ver}"
+                    ),
                 ));
             }
+        } else {
+            return Err(RpcProblem::new(
+                -32600,
+                "Missing currentRotationVersion for FROST recovery",
+            ));
         }
+        let (session_id, envelope) =
+            frost::frost_recovery_round1(&mpc_key_id, &state).await?;
+        return Ok(json!(StartResponse { session_id, server_payload: envelope }));
+    }
+    if is_frost_recovery_rn {
+        let session_id = params.session_id.as_ref().unwrap().clone();
+        if params.round == 2 {
+            let client_payload = params.client_payload.ok_or_else(|| {
+                RpcProblem::new(-32600, "Missing clientPayload for FROST recovery round 2")
+            })?;
+            let envelope =
+                frost::frost_recovery_round2(&session_id, &client_payload, &state).await?;
+            return Ok(json!(StartResponse {
+                session_id,
+                server_payload: envelope,
+            }));
+        }
+        if params.round == 3 {
+            let client_payload = params.client_payload.ok_or_else(|| {
+                RpcProblem::new(-32600, "Missing clientPayload for FROST recovery round 3")
+            })?;
+            let (mpc_key_id, address, rotation_version) =
+                frost::frost_recovery_round3(&session_id, &client_payload, &state).await?;
+            let public_key = state
+                .frost_keystore
+                .get(&mpc_key_id)
+                .and_then(|r| {
+                    r.public_key_package
+                        .verifying_key()
+                        .serialize()
+                        .map(|b| hex::encode(b.as_ref() as &[u8]))
+                        .ok()
+                })
+                .unwrap_or_default();
+            return Ok(json!(RecoveryCompletedResponse {
+                status: "completed",
+                mpc_key_id,
+                address,
+                public_key,
+                rotation_version,
+                local_encrypted_share: String::new(),
+            }));
+        }
+        return Err(RpcProblem::new(
+            -32600,
+            format!("Unsupported FROST recovery round: {}", params.round),
+        ));
     }
 
     if params.round == 1 {
@@ -372,40 +402,7 @@ fn random_seed() -> [u8; 32] {
     seed
 }
 
-fn decode_client_envelope(
-    payload_json: &str,
-    expected_session: &str,
-    expected_protocol: ProtocolType,
-) -> Result<Vec<u8>, RpcProblem> {
-    let env: WireEnvelope = serde_json::from_str(payload_json)
-        .map_err(|e| RpcProblem::new(-32600, format!("invalid clientPayload JSON: {e}")))?;
-
-    if env.session_id != expected_session {
-        return Err(RpcProblem::new(
-            -32600,
-            "clientPayload.session_id does not match sessionId",
-        ));
-    }
-    if env.protocol != expected_protocol {
-        return Err(RpcProblem::new(
-            -32600,
-            "clientPayload.protocol does not match method",
-        ));
-    }
-    if env.from_id != 0 {
-        return Err(RpcProblem::new(
-            -32600,
-            format!("expected from_id=0, got {}", env.from_id),
-        ));
-    }
-    // round in WireEnvelope is informational — not validated against RPC round param
-    // (envelope round = message origin round, RPC round = call sequence number)
-
-    BASE64_STANDARD
-        .decode(&env.payload)
-        .map_err(|e| RpcProblem::new(-32600, format!("base64 decode client payload failed: {e}")))
-}
-
+#[cfg(test)]
 fn encode_server_envelope(
     session_id: String,
     protocol: ProtocolType,
